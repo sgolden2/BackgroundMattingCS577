@@ -4,11 +4,13 @@ from keras.models import Sequential
 from keras.layers import *
 from keras.optimizers import Adam
 from keras.applications import ResNet101
+import keras.backend as K
+
 
 #tf.config.experimental_run_functions_eagerly(True)
 tf.compat.v1.disable_eager_execution() 
 
-MOMENTUM = 0.1
+MOMENTUM = 0.15
 EPSILON = 1e-5
 DROPOUT_RATE = 0.15
 
@@ -17,27 +19,26 @@ ASPP_FILTERS = 256
 
 DECODER_CHANNELS = [128, 64, 48, 37]
 
+BASE_MODEL_SCALE = float(1/4)
+
+REFINER_CHANNELS = [24, 16, 12, 4]
+
 
 def base_alpha_mse_loss(pha_true, preds):
 	pha_pred = tf.clip_by_value(preds[:, :, :, 0:1], 0, 1)
-	#fgr = preds[:, :, :, 1:4]
-	#err = tf.clip_by_value(preds[:, :, :, 4:5], 0, 1)
-	#hid = tf.nn.relu(preds[:, :, :, 5:])
-
-	'''
-	print(type(pha_true), type(preds))
-	print(pha_true.shape, preds.shape)
-	print(tf.shape(pha_true), tf.shape(preds))
-	'''
-
 	pha_true = tf.cast(tf.reshape(pha_true, tf.shape(pha_pred)), tf.float32)
-
 	return tf.math.squared_difference(pha_true, pha_pred)
 
 
+def full_alpha_mse_loss(pha_true, pha_pred):
+	pha_true = tf.cast(tf.reshape(pha_true, tf.shape(pha_pred)), tf.float32)
+	return tf.math.squared_difference(pha_true, pha_pred)
 
-def get_base_model(input_shape=(768,432,6)):
+
+def get_base_model(input_shape=(768,432,6), compiled=True):
+
 	### ResNet Backbone ###
+
 	inp = Input(shape=input_shape)
 	img,bgr = Lambda(lambda x: tf.split(x,2,axis=-1))(inp)
 	#reduced_channels = Conv3D(filters=512, kernel_size=(3,3,2),padding='SAME')(inp)
@@ -96,7 +97,6 @@ def get_base_model(input_shape=(768,432,6)):
 	pyr = ReLU()(pyr)
 	pyr = Dropout(DROPOUT_RATE)(pyr)
 
-
 	### DECODER ###
 
 	x4,x3,x2,x1,x0 = pyr, resblock3, resblock2, resblock1, backbone_in
@@ -127,8 +127,80 @@ def get_base_model(input_shape=(768,432,6)):
 
 	out = x
 
-
 	### COMPILE ###
+
 	model = Model(inputs=inp, outputs=out)
-	model.compile(optimizer='adam', loss=base_alpha_mse_loss)
+
+	if compiled:
+		model.compile(optimizer='adam', loss=base_alpha_mse_loss)
+
+	return model
+
+
+def get_full_model(input_shape=(768,432,6), compiled=True):
+	full_dims = (int(input_shape[0]), int(input_shape[1]))
+	half_dims = (int(input_shape[0] * (1/2)), int(input_shape[1] * (1/2)))
+	quart_dims = (int(input_shape[0] * (1/4)), int(input_shape[1] * (1/4)))
+	coarse_dims = (int(input_shape[0] * BASE_MODEL_SCALE), int(input_shape[1] * BASE_MODEL_SCALE))
+
+	inp = Input(shape=input_shape)
+	img,bgr = Lambda(lambda x: tf.split(x,2,axis=-1))(inp)
+	
+	coarse_img = tf.image.resize(img, coarse_dims)
+	coarse_bgr = tf.image.resize(bgr, coarse_dims)
+
+	base_model_out = get_base_model(input_shape=coarse_dims+(6,), compiled=False)(tf.concat([coarse_img,coarse_bgr],axis=-1))
+
+	alpha, forgr = tf.clip_by_value(base_model_out[:, :, :, 0:1], 0, 1), base_model_out[:, :, :, 1:4]
+	error, hiddn = tf.clip_by_value(base_model_out[:, :, :, 4:5], 0, 1), tf.nn.relu(base_model_out[:, :, :, 5:])
+
+	trim_err = tf.concat([hiddn, alpha, forgr], axis=-1)
+	orig = tf.concat([img,bgr], axis=-1)
+
+	sample_feats = tf.image.resize(trim_err, half_dims)
+	sample_image = tf.image.resize(orig, half_dims)
+	sample = tf.concat([sample_feats,sample_image], axis=-1)
+	sample = tf.pad(sample, 
+		tf.constant([
+			[0, 0], 
+			[3, 3], 
+			[3, 3], 
+			[0, 0]]
+		)
+	)
+
+	x = Conv2D(REFINER_CHANNELS[0], 3, use_bias=False)(sample)
+	x = BatchNormalization(momentum=MOMENTUM, epsilon=EPSILON)(x)
+	x = ReLU()(x)
+	x = Conv2D(REFINER_CHANNELS[1], 3, use_bias=False)(sample)
+	x = BatchNormalization(momentum=MOMENTUM, epsilon=EPSILON)(x)
+	x = ReLU()(x)
+	x = tf.image.resize(x, (full_dims[0]+4,full_dims[1]+4), 'nearest')
+	sample = tf.pad(orig, 
+		tf.constant([
+			[0, 0], 
+			[2, 2], 
+			[2, 2], 
+			[0, 0]]
+		)
+	)
+
+	x = tf.concat([x,sample], axis=-1)
+	x = Conv2D(REFINER_CHANNELS[2], 3, use_bias=False)(x)
+	x = BatchNormalization(momentum=MOMENTUM, epsilon=EPSILON)(x)
+	x = ReLU()(x)
+	x = Conv2D(REFINER_CHANNELS[3], 3, use_bias=True)(x)
+
+	alpha = tf.clip_by_value(x[:,:,:,0], 0, 1), 
+	#foreground = tf.clip_by_value(x[:,:,:,1:]+img, 0, 1)
+	#refined = tf.ones((full_dims[0], 1, quart_dims[1], quart_dims[0]), dtype=img.dtype)
+
+	#out = tf.concat([alpha,foreground], axis=-1)
+	out = alpha
+
+	model = Model(inputs=inp, outputs=out)
+
+	if compiled:
+		model.compile(optimizer='adam', loss=full_alpha_mse_loss)
+
 	return model

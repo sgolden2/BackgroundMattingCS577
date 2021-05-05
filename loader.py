@@ -12,7 +12,7 @@ IMAGE_DIMS = (768,432)
 BATCH_SIZE = 8
 
 model = get_base_model(input_shape=TENSOR_SHAPE)
-model.load_weights('134548_04052021_MODEL_WEIGHTS.h5')
+model.load_weights('193717_04052021_MODEL_WEIGHTS.h5')
 
 
 test_img_data = ImageDataGenerator()
