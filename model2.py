@@ -48,14 +48,12 @@ def get_base_model(input_shape=(768,432,6), compiled=True):
 		include_top=False,
 		input_tensor=img
 	)
-
 	resnet.trainable=False
 	backbone_in = resnet.input
 	resblock1 = resnet.get_layer('conv1_relu').output
 	resblock2 = resnet.get_layer('conv2_block3_out').output
 	resblock3 = resnet.get_layer('conv3_block4_out').output
 	backbone_out = resnet.output
-
 	x = backbone_out
 	#x = Add()([img_res,bgr_res])
 
@@ -107,7 +105,8 @@ def get_base_model(input_shape=(768,432,6), compiled=True):
 	x = BatchNormalization(momentum=MOMENTUM, epsilon=EPSILON)(x)
 	x = ReLU()(x)
 
-	x = Lambda(lambda a: tf.image.resize(a, tf.shape(x2)[1:3]))(x)
+	
+	
 	x = tf.concat([x,x2],axis=-1)
 	x = Conv2D(DECODER_CHANNELS[1], 3, padding='SAME', use_bias=False)(x)
 	x = BatchNormalization(momentum=MOMENTUM, epsilon=EPSILON)(x)
